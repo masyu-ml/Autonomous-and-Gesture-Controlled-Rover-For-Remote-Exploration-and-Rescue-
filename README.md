@@ -7,3 +7,4 @@ Developers:
 Baldovino, Gabriel Raia
 Basilio, Ralph Matthew 
 Francisco, Yuan Miguel
+Watch demo here: https://www.linkedin.com/posts/matthew-basilio-2b7470252_robotics-embeddedsystems-computervision-activity-7425359510296412161-9T7a?utm_source=share&utm_medium=member_desktop&rcm=ACoAAD5cSKsBTjZ4Hr_dAQlWt-yBRU8424m0gcE
