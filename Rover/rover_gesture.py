@@ -2,9 +2,9 @@
 =============================================================
   Rover Control Panel — HAND GESTURE MODE (LOCAL WEBCAM)
 =============================================================
-  High Five  : Open Claw      Fist       : Close Claw
-  Point      : Forward        Peace Sign : Backward
-  Thumbs Up  : Turn Right     L Sign     : Turn Left
+  High Five      : Open Claw      Fist       : Close Claw
+  Point          : Forward        Peace Sign : Backward
+  Three Fingers  : Turn Right     L Sign     : Turn Left
 =============================================================
 """
 
@@ -23,7 +23,7 @@ from PyQt5.QtCore import pyqtSlot, Qt, pyqtSignal, QUrl, QPropertyAnimation, QEa
 # =============================================================
 #  CONFIG
 # =============================================================
-ESP32_ROVER_IP     = "192.168.1.8"
+ESP32_ROVER_IP     = "192.168.0.187"
 ROVER_WS_URL       = f"ws://{ESP32_ROVER_IP}:81/"
 
 CMD_FORWARD  = "F"
@@ -195,21 +195,21 @@ class GestureWorker(QObject):
         if fingers_up == 0 and not th_out and not th_up:
             return "CLOSE"
 
-        # 3. Peace Sign (Backward) -> Index and Middle up only
+        # 3. Three Fingers (Right Turn) -> Index, Middle, Ring up; Pinky down
+        if i_up and m_up and r_up and not p_up:
+            return "R"
+
+        # 4. Peace Sign (Backward) -> Index and Middle up only
         if i_up and m_up and not r_up and not p_up:
             return "B"
 
-        # 4. Point Finger (Forward) -> Index only, thumb tucked
+        # 5. Point Finger (Forward) -> Index only, thumb tucked
         if i_up and fingers_up == 1 and not th_out and not th_up:
             return "F"
 
-        # 5. L Sign (Left Turn) -> Index up, thumb out
+        # 6. L Sign (Left Turn) -> Index up, thumb out
         if i_up and fingers_up == 1 and (th_out or th_up):
             return "L"
-
-        # 6. Thumbs Up (Right Turn) -> Zero fingers up, thumb out/up
-        if fingers_up == 0 and (th_up or th_out):
-            return "R"
 
         return None
 
@@ -419,8 +419,9 @@ class AppWindow(QMainWindow):
         fl = QVBoxLayout(frame); fl.setContentsMargins(25,25,25,25)
         grid = QWidget(); gl = QGridLayout(grid); gl.setVerticalSpacing(12)
 
+        # 🚨 UPDATED UI LABELS
         controls = [
-            ("L Sign", "Left"), ("Thumbs Up", "Right"),
+            ("L Sign", "Left"), ("Three Fingers", "Right"),
             ("Point (Index)", "Forward"),  ("Peace Sign", "Backward"),
             ("Fist", "Close Claw"),     ("High Five", "Open Claw"),
         ]
@@ -465,7 +466,7 @@ class AppWindow(QMainWindow):
         w = QWidget(); lo = QHBoxLayout(w); lo.setContentsMargins(0,0,0,0)
         lo.addWidget(QLabel("This Software is created for educational purposes")); lo.addStretch()
         b = QLabel("Beta"); b.setObjectName("betaTag"); lo.addWidget(b)
-        v = QLabel("v3.3.0"); v.setObjectName("versionTag"); lo.addWidget(v)
+        v = QLabel("v3.4.0"); v.setObjectName("versionTag"); lo.addWidget(v)
         return w
 
     def _shadow(self, w):
@@ -497,12 +498,12 @@ class AppWindow(QMainWindow):
 
     def _menu(self, name):
         if name == "about":
-            QMessageBox.information(self,"About","Rover Gesture Mode v3.3 (High Accuracy)\n\nDeveloped by Basilio, Baldovino and Francisco.")
+            QMessageBox.information(self,"About","Rover Gesture Mode v3.4 (High Accuracy)\n\nDeveloped by Basilio, Baldovino and Francisco.")
         elif name == "instructions":
             QMessageBox.information(self,"Instructions",
                 "High Five → Open Claw\nFist → Close Claw\n"
                 "Peace Sign → Backward\nPoint Finger → Forward\n"
-                "L Sign → Turn Left\nThumbs Up → Turn Right")
+                "L Sign → Turn Left\nThree Fingers → Turn Right")
         elif name == "github":  QDesktopServices.openUrl(QUrl("https://github.com/masyu-ml"))
         elif name == "support": QDesktopServices.openUrl(QUrl("mailto:basilioralph341@gmail.com"))
         elif name == "exit":    self.close()
