@@ -1,6 +1,6 @@
 """
 =============================================================
-  Rover Control Panel — MANUAL MODE
+  Rover Control Panel — MANUAL MODE (CRASH-PROOF)
 =============================================================
   W/A/S/D  : Forward / Left / Backward / Right
   O        : Open Claw
@@ -22,7 +22,7 @@ from PyQt5.QtCore import pyqtSlot, Qt, pyqtSignal, QUrl, QPropertyAnimation, QEa
 # =============================================================
 #  CONFIG
 # =============================================================
-ESP32_ROVER_IP     = "192.168.1.8"
+ESP32_ROVER_IP     = "192.168.0.187"
 ROVER_WS_URL       = f"ws://{ESP32_ROVER_IP}:81/"
 
 UDP_STREAM_PORT    = 5005
@@ -38,8 +38,8 @@ CMD_OPEN     = "OPEN"
 CMD_CLOSE    = "CLOSE"
 
 FRAME_WIDTH, FRAME_HEIGHT = 640, 480
-MIN_SPEED = 130
-MAX_SPEED = 150
+MIN_SPEED = 127
+MAX_SPEED = 130
 
 
 # =============================================================
@@ -54,19 +54,21 @@ class UDPCameraReceiver:
         self._latest_frame = None
         self._frame_lock   = threading.Lock()
         self._ip_lock      = threading.Lock()
-        self._frame_id     = 0          # increments every time a new frame is stored
+        self._frame_id     = 0
         self._cmd_sock     = None
         self.running       = False
+        self.frame_event   = threading.Event()
 
     def start(self):
         self.running = True
         threading.Thread(target=self._discovery_loop, daemon=True, name="UDPDisc").start()
         threading.Thread(target=self._recv_loop,      daemon=True, name="UDPRecv").start()
 
-    def stop(self): self.running = False
+    def stop(self):
+        self.running = False
+        self.frame_event.set()
 
     def get_latest_frame(self):
-        """Returns (frame_id, frame) so callers can detect new frames without copying."""
         with self._frame_lock:
             if self._latest_frame is None:
                 return -1, None
@@ -116,6 +118,7 @@ class UDPCameraReceiver:
             cidx    = int.from_bytes(data[8:12],  "little")
             ccount  = int.from_bytes(data[12:16], "little")
             payload = data[16:]
+
             if ccount > 200 or t_size > 200_000 or fid <= last_complete: continue
             if fid not in buf:
                 if len(buf) >= self.MAX_BUFFERED:
@@ -128,13 +131,14 @@ class UDPCameraReceiver:
                 if frame is not None:
                     with self._frame_lock:
                         self._latest_frame = frame
-                        self._frame_id    += 1      # signal that a new frame is ready
+                        self._frame_id    += 1
+                    self.frame_event.set()
                 last_complete = fid
             now   = time.time()
             stale = [f for f in list(buf) if f <= last_complete or now - t_map.get(f, now) > self.FRAME_TIMEOUT]
             for f in stale: buf.pop(f, None); t_map.pop(f, None)
             if now - fps_t >= 5.0:
-                print(f"[UDP] {fps_sent / max(now - fps_t, 1):.1f} FPS")
+                print(f"[UDP] Camera Feed: {fps_sent / max(now - fps_t, 1):.1f} FPS")
                 fps_sent = 0; fps_t = now
             else: fps_sent += 1
         try: s.close(); self._cmd_sock.close()
@@ -158,7 +162,7 @@ class RoverController(QObject):
         self._last_pong   = time.time()
         self._ws_healthy  = False
         self.running      = False
-        self.pressed_keys = set()
+        self.pressed_keys = []
         self.last_cmd     = None
         self.last_claw    = None
         self.current_speed = -1
@@ -182,6 +186,7 @@ class RoverController(QObject):
         if not self.running: return
         self.log_message.emit("[CTRL] Stopping...")
         self.running = False
+        self.udp_cam.frame_event.set()
         for t in (self._ws_recv_thread, self._udp_disp_thread):
             if t and t.is_alive(): t.join(timeout=1.5)
         with self._ws_lock:
@@ -234,23 +239,17 @@ class RoverController(QObject):
             except: pass
 
     def _udp_disp_loop(self):
-        """
-        Emit a new QImage only when the UDP receiver has produced a frame
-        we haven't displayed yet. Tracks _frame_id to skip stale frames,
-        so the display always shows the freshest image without a fixed sleep.
-        """
-        last_emitted_id = -1
         while self.running:
-            fid, frame = self.udp_cam.get_latest_frame()
-            if fid == last_emitted_id or frame is None:
-                # No new frame yet — yield CPU briefly and check again
-                time.sleep(0.005)
-                continue
-            last_emitted_id = fid
-            frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
-            rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb.shape
-            self.frame_ready.emit(QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy())
+            if self.udp_cam.frame_event.wait(timeout=0.1):
+                self.udp_cam.frame_event.clear()
+                if not self.running: break
+
+                fid, frame = self.udp_cam.get_latest_frame()
+                if frame is not None:
+                    frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+                    rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    h, w, ch = rgb.shape
+                    self.frame_ready.emit(QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy())
 
     def _send_raw(self, cmd: str):
         if not self.running: return
@@ -285,28 +284,28 @@ class RoverController(QObject):
     @pyqtSlot(str)
     def manual_key_press(self, key_char: str):
         if key_char in self.pressed_keys: return
-        self.pressed_keys.add(key_char)
+
+        self.pressed_keys.append(key_char)
         self._send_speed(MAX_SPEED)
-        if key_char == 'w':
-            self._send_motor("F")  # F is now Forward
-        elif key_char == 's':
-            self._send_motor("B")  # B is now Backward
-        elif key_char == 'a':
-            self._send_motor("L")  # L is now Left
-        elif key_char == 'd':
-            self._send_motor("R")  # R is now Right
-        elif key_char == 'o':
-            self._send_claw(CMD_OPEN)
-        elif key_char == 'c':
-            self._send_claw(CMD_CLOSE)
+        self._evaluate_motor_keys()
+
+        if key_char == 'o': self._send_claw(CMD_OPEN)
+        elif key_char == 'c': self._send_claw(CMD_CLOSE)
 
     @pyqtSlot(str)
     def manual_key_release(self, key_char: str):
         if key_char not in self.pressed_keys: return
-        self.pressed_keys.discard(key_char)
-        if key_char in ('w', 'a', 's', 'd'):
-            if not any(k in self.pressed_keys for k in ('w', 'a', 's', 'd')):
-                self._send_motor(CMD_STOP)
+        self.pressed_keys.remove(key_char)
+        self._evaluate_motor_keys()
+
+    def _evaluate_motor_keys(self):
+        for key in reversed(self.pressed_keys):
+            if key == 'w': self._send_motor("F"); return
+            elif key == 's': self._send_motor("B"); return
+            elif key == 'a': self._send_motor("L"); return
+            elif key == 'd': self._send_motor("R"); return
+
+        self._send_motor(CMD_STOP)
 
 
 # =============================================================
@@ -354,6 +353,10 @@ class MenuWidget(QWidget):
 #  APP WINDOW
 # =============================================================
 class AppWindow(QMainWindow):
+    # 🚨 NEW: Safe custom signals for strictly separated threading
+    cmd_key_pressed = pyqtSignal(str)
+    cmd_key_released = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Rover — Manual Mode")
@@ -374,10 +377,16 @@ class AppWindow(QMainWindow):
         self.ctrl   = RoverController(self.udp_cam)
         self.thread = QThread()
         self.ctrl.moveToThread(self.thread)
+
         self.ctrl.frame_ready.connect(self._on_frame)
         self.ctrl.log_message.connect(lambda m: print(m))
         self.ctrl.connection_failed.connect(self._on_conn_fail)
         self.ctrl.tof_reading.connect(self._on_tof)
+
+        # 🚨 NEW: Connect UI signals to the background thread slots
+        self.cmd_key_pressed.connect(self.ctrl.manual_key_press)
+        self.cmd_key_released.connect(self.ctrl.manual_key_release)
+
         self.thread.started.connect(self.ctrl.start)
         self.thread.start()
 
@@ -447,7 +456,7 @@ class AppWindow(QMainWindow):
         w = QWidget(); lo = QHBoxLayout(w); lo.setContentsMargins(0, 0, 0, 0)
         lo.addWidget(QLabel("This Software is created for educational purposes")); lo.addStretch()
         b = QLabel("Beta"); b.setObjectName("betaTag"); lo.addWidget(b)
-        v = QLabel("v3.0.0"); v.setObjectName("versionTag"); lo.addWidget(v)
+        v = QLabel("v3.3.0"); v.setObjectName("versionTag"); lo.addWidget(v)
         return w
 
     def _shadow(self, w):
@@ -469,7 +478,7 @@ class AppWindow(QMainWindow):
 
     @pyqtSlot(float)
     def _on_tof(self, mm):
-        status = "IN CLAW ✅" if mm < 100 else "EMPTY"
+        status = "IN CLAW ✅" if mm < 85 else "EMPTY"
         self.tof_lbl.setText(f"ToF: {mm:.0f} mm  [{status}]")
 
     @pyqtSlot(str)
@@ -487,7 +496,7 @@ class AppWindow(QMainWindow):
 
     def _menu(self, name):
         if name == "about":
-            QMessageBox.information(self, "About", "Rover Manual Mode v3.0\n\nDeveloped by Basilio, Baldovino and Francisco.")
+            QMessageBox.information(self, "About", "Rover Manual Mode v3.3\n\nDeveloped by Basilio, Baldovino and Francisco.")
         elif name == "instructions":
             QMessageBox.information(self, "Instructions", "W/A/S/D: move\nO: Open claw\nC: Close claw")
         elif name == "github":  QDesktopServices.openUrl(QUrl("https://github.com/masyu-ml"))
@@ -498,13 +507,13 @@ class AppWindow(QMainWindow):
         if e.isAutoRepeat(): return
         k = {Qt.Key_W:'w', Qt.Key_A:'a', Qt.Key_S:'s',
              Qt.Key_D:'d', Qt.Key_O:'o', Qt.Key_C:'c'}.get(e.key())
-        if k: self.ctrl.manual_key_press(k)
+        if k: self.cmd_key_pressed.emit(k) # 🚨 Emits signal instantly!
 
     def keyReleaseEvent(self, e):
         if e.isAutoRepeat(): return
         k = {Qt.Key_W:'w', Qt.Key_A:'a', Qt.Key_S:'s',
              Qt.Key_D:'d', Qt.Key_O:'o', Qt.Key_C:'c'}.get(e.key())
-        if k: self.ctrl.manual_key_release(k)
+        if k: self.cmd_key_released.emit(k) # 🚨 Emits signal instantly!
 
     def closeEvent(self, e):
         self.udp_cam.stop(); self.ctrl.stop()
@@ -531,12 +540,8 @@ QLineEdit:focus { border:1px solid rgba(255,255,255,0.8); }
 #versionTag { background-color:rgba(0,0,0,0.2); color:#ffffff; border:none; padding:5px 9px; border-radius:7px; font-size:12px; }
 #MenuItemWidget { border-radius:8px; }
 #MenuItemWidget QLabel { background-color:transparent; }
-QPushButton#autoButtonStart    { font-size:14px; font-weight:500; color:#fff; padding:10px; border-radius:8px; background-color:#007aff; }
-QPushButton#autoButtonStart:hover    { background-color:#005ecb; }
 QPushButton#autoButtonPause    { font-size:14px; font-weight:500; color:#fff; padding:10px; border-radius:8px; background-color:#ff9500; }
 QPushButton#autoButtonPause:hover    { background-color:#d97e00; }
-QPushButton#autoButtonContinue { font-size:14px; font-weight:500; color:#fff; padding:10px; border-radius:8px; background-color:#34c759; }
-QPushButton#autoButtonContinue:hover { background-color:#2ca049; }
 QSlider::groove:horizontal { height:6px; background:rgba(0,0,0,0.15); border-radius:3px; }
 QSlider::handle:horizontal  { width:16px; height:16px; margin:-5px 0; border-radius:8px; background:#007aff; }
 """
