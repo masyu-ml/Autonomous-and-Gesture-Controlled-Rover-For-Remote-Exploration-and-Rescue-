@@ -1,0 +1,147 @@
+#include <WiFi.h>
+#include <WebSocketsServer.h>
+#include <Arduino.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h>
+
+// ==== WiFi Credentials ====
+const char* ssid = "Rover_AP";
+const char* password = "rover1129";
+
+// ==== Motor Driver Pins ====
+#define AIN1 13
+#define AIN2 14
+#define BIN1 16
+#define BIN2 17
+#define PWMA 18
+#define PWMB 19
+#define STBY 21
+#define SERVO_PIN 22
+#define SDA_PIN 25
+#define SCL_PIN 26
+
+// ==== Objects ====
+Servo clawServo;
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
+WebSocketsServer webSocket = WebSocketsServer(81);
+
+// ==== Global State ====
+volatile int speedPWM = 130;
+volatile int targetAngle = 30; // 30 = Open, 108 = Closed
+String currentMode = "MANUAL";
+bool sensorFound = false;
+
+TaskHandle_t Task_Servo;
+
+void ServoControlTask(void * pvParameters) {
+  ESP32PWM::allocateTimer(0);
+  clawServo.setPeriodHertz(50);
+  clawServo.attach(SERVO_PIN, 500, 2400);
+  for(;;) {
+    clawServo.write(targetAngle);
+    vTaskDelay(20 / portTICK_PERIOD_MS); 
+  }
+}
+
+void handleSensor() {
+  if (!sensorFound || currentMode != "AUTO") return;
+  static uint32_t lastRead = 0;
+  if (millis() - lastRead < 65) return;
+  lastRead = millis();
+  VL53L0X_RangingMeasurementData_t measure;
+  lox.rangingTest(&measure, false); 
+  if (measure.RangeStatus != 4) {
+    uint16_t dist = measure.RangeMilliMeter;
+    webSocket.broadcastTXT("DIST:" + String(dist));
+    if (dist < 100) targetAngle = 108; // Close
+    else targetAngle = 30;             // Open
+  }
+}
+
+// ----------------- RE-MAPPED MOTOR FUNCTIONS -----------------
+
+
+void moveForward(int s) { 
+ digitalWrite(STBY, HIGH); 
+  
+  digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH); 
+  digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW); 
+  analogWrite(PWMA, s); analogWrite(PWMB, s); 
+}
+
+void moveBackward(int s) { 
+   digitalWrite(STBY, HIGH); 
+ 
+  digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW); 
+  digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH); 
+  analogWrite(PWMA, s); analogWrite(PWMB, s); 
+}
+
+void moveLeft(int s) { 
+  digitalWrite(STBY, HIGH);
+  
+  digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH);
+  digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
+  analogWrite(PWMA, s); analogWrite(PWMB, s);
+}
+
+void moveRight(int s) { 
+ digitalWrite(STBY, HIGH);
+ 
+  digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+  analogWrite(PWMA, s); analogWrite(PWMB, s);
+}
+
+void stopMotors() { 
+  digitalWrite(STBY, LOW); 
+  analogWrite(PWMA, 0); analogWrite(PWMB, 0); 
+}
+
+// ----------------- WebSocket Events (LOGIC CLEANED) -----------------
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_TEXT) {
+    String cmd = String((char*)payload);
+    cmd.trim();
+    
+    if (cmd == "MODE_AUTO") currentMode = "AUTO";
+    else if (cmd == "MODE_MANUAL") currentMode = "MANUAL";
+    else if (cmd == "OPEN") targetAngle = 30;
+    else if (cmd == "CLOSE") targetAngle = 108;
+    
+  
+    else if (cmd == "F")    moveForward(speedPWM);
+    else if (cmd == "B")    moveBackward(speedPWM);
+    else if (cmd == "L")    moveLeft(speedPWM);
+    else if (cmd == "R")    moveRight(speedPWM);
+    
+    else if (cmd == "STOP") stopMotors();
+    else if (cmd.startsWith("SPD")) speedPWM = cmd.substring(3).toInt();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT); pinMode(PWMB, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  stopMotors();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  if (lox.begin()) sensorFound = true;
+  xTaskCreatePinnedToCore(ServoControlTask, "ServoTask", 4096, NULL, 1, &Task_Servo, 0);
+}
+
+void loop() {
+  webSocket.loop();
+  handleSensor();
+}
