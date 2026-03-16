@@ -26,6 +26,10 @@ from PyQt5.QtCore import pyqtSlot, Qt, pyqtSignal, QUrl, QPropertyAnimation, QEa
 ESP32_ROVER_IP     = "192.168.0.187"
 ROVER_WS_URL       = f"ws://{ESP32_ROVER_IP}:81/"
 
+# 🚨 ESP-12E ULTRASONIC SENSOR CONFIG
+ESP12E_SENSOR_IP   = "192.168.0.188"
+SENSOR_WS_URL      = f"ws://{ESP12E_SENSOR_IP}:81/"
+
 CMD_FORWARD  = "F"
 CMD_BACKWARD = "B"
 CMD_LEFT     = "L"
@@ -39,7 +43,7 @@ MAX_SPEED = 150
 
 
 # =============================================================
-#  GESTURE WORKER (HIGH ACCURACY CPU MODE)
+#  GESTURE WORKER (HIGH ACCURACY + SMOOTHING)
 # =============================================================
 class GestureWorker(QObject):
     frame_ready = pyqtSignal(QImage)
@@ -50,6 +54,7 @@ class GestureWorker(QObject):
         super().__init__()
         self._running = False
         self._thread = None
+        self._last_points = None # Used for smoothing the jitter
 
         self.FINGER_PATHS = [
             [0, 1, 2, 3, 4],        # Thumb
@@ -72,14 +77,13 @@ class GestureWorker(QObject):
         self._thread = None
 
     def _loop(self):
-        self.log_message.emit("[GESTURE] Booting High-Accuracy CPU Engine…")
+        self.log_message.emit("[GESTURE] Booting Ultra-Stable CPU Engine…")
         try:
             import mediapipe as mp
             from mediapipe.tasks import python
             from mediapipe.tasks.python import vision
 
             model_path = r"C:\Rover\hand_landmarker.task"
-
             if not os.path.exists(model_path):
                 self.log_message.emit(f"[GESTURE] ERROR: Missing {model_path}")
                 return
@@ -89,12 +93,14 @@ class GestureWorker(QObject):
                 delegate=python.BaseOptions.Delegate.CPU
             )
 
-            # Increased confidence thresholds for strictly accurate tracking
+            # ✅ FIX 1: VIDEO mode — uses temporal tracking, no per-frame re-detection
             options = vision.HandLandmarkerOptions(
                 base_options=base_options,
                 num_hands=1,
-                min_hand_detection_confidence=0.80,
-                min_tracking_confidence=0.70
+                min_hand_detection_confidence=0.75,
+                min_hand_presence_confidence=0.6,
+                min_tracking_confidence=0.5,
+                running_mode=vision.RunningMode.VIDEO  # KEY CHANGE
             )
             detector = vision.HandLandmarker.create_from_options(options)
 
@@ -102,10 +108,11 @@ class GestureWorker(QObject):
             self.log_message.emit(f"[GESTURE] Init failed: {e}")
             return
 
-        # Upgraded to HD resolution request to feed the AI better data
+        # ✅ FIX 2: 640x480 — fast enough for stable 30fps processing
         cap = cv2.VideoCapture(0, cv2.CAP_ANY)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not cap.isOpened():
@@ -117,52 +124,80 @@ class GestureWorker(QObject):
         last_cmd = None
         last_cmd_time = 0.0
         COOLDOWN = 0.25
+        SMOOTHING = 0.55
+
+        # ✅ FIX 3: Gesture confirmation buffer — must see same gesture 3 frames
+        gesture_buffer = []
+        CONFIRM_FRAMES = 3
 
         try:
             while self._running:
                 ret, frame = cap.read()
                 if not ret:
-                    time.sleep(0.01)
+                    time.sleep(0.01);
                     continue
 
                 frame = cv2.flip(frame, 1)
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                result = detector.detect(mp_image)
+
+                # ✅ VIDEO mode requires timestamp
+                timestamp_ms = int(time.time() * 1000)
+                result = detector.detect_for_video(mp_image, timestamp_ms)
+
                 gesture = None
 
                 if result.hand_landmarks:
                     hlm = result.hand_landmarks[0]
                     h, w, _ = rgb_frame.shape
 
-                    # Sub-Pixel Precision: Use round() instead of int() to prevent truncation drift
-                    points = np.array([[round(lm.x * w), round(lm.y * h)] for lm in hlm], dtype=np.int32)
+                    raw_points = np.array([[lm.x * w, lm.y * h] for lm in hlm], dtype=np.float32)
 
-                    # Draw thicker, anti-aliased skeleton lines
+                    if self._last_points is None:
+                        self._last_points = raw_points
+                    else:
+                        self._last_points = (self._last_points * (1.0 - SMOOTHING)) + (raw_points * SMOOTHING)
+
+                    points = np.round(self._last_points).astype(np.int32)
+
+                    # Draw skeleton
                     paths = [points[path] for path in self.FINGER_PATHS]
-                    cv2.polylines(rgb_frame, paths, isClosed=False, color=(200, 255, 255), thickness=3, lineType=cv2.LINE_AA)
-
-                    # Draw Dual-Tone Precision Nodes (Red outer, White inner)
+                    cv2.polylines(rgb_frame, paths, isClosed=False,
+                                  color=(200, 255, 255), thickness=3, lineType=cv2.LINE_AA)
                     for p in points:
                         cv2.circle(rgb_frame, tuple(p), 6, (255, 0, 0), -1, lineType=cv2.LINE_AA)
                         cv2.circle(rgb_frame, tuple(p), 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)
 
                     gesture = self._classify(hlm)
+                else:
+                    self._last_points = None
+
+                # ✅ FIX 3: Confirmation buffer
+                gesture_buffer.append(gesture)
+                if len(gesture_buffer) > CONFIRM_FRAMES:
+                    gesture_buffer.pop(0)
+
+                # Only act if last N frames agree
+                confirmed = None
+                if len(gesture_buffer) == CONFIRM_FRAMES:
+                    if all(g == gesture_buffer[0] for g in gesture_buffer) and gesture_buffer[0] is not None:
+                        confirmed = gesture_buffer[0]
 
                 now = time.time()
-
-                if gesture and (gesture != last_cmd or now - last_cmd_time > COOLDOWN):
-                    self.gesture_cmd.emit(gesture)
-                    last_cmd = gesture
+                if confirmed and (confirmed != last_cmd or now - last_cmd_time > COOLDOWN):
+                    self.gesture_cmd.emit(confirmed)
+                    last_cmd = confirmed;
                     last_cmd_time = now
-                elif not gesture and last_cmd not in (None, "STOP"):
-                    self.gesture_cmd.emit("STOP")
-                    last_cmd = "STOP"
+                elif not confirmed and last_cmd not in (None, "STOP"):
+                    # Only stop after 5 consecutive None frames — prevents jitter stops
+                    if all(g is None for g in gesture_buffer[-5:] if len(gesture_buffer) >= 5):
+                        self.gesture_cmd.emit("STOP")
+                        last_cmd = "STOP"
 
-                if gesture:
+                if confirmed:
                     cv2.rectangle(rgb_frame, (10, 10), (220, 60), (0, 0, 0), -1)
-                    cv2.putText(rgb_frame, f"CMD: {gesture}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2, cv2.LINE_AA)
+                    cv2.putText(rgb_frame, f"CMD: {confirmed}", (20, 45),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2, cv2.LINE_AA)
 
                 h2, w2, ch = rgb_frame.shape
                 self.frame_ready.emit(QImage(rgb_frame.data, w2, h2, ch * w2, QImage.Format_RGB888).copy())
@@ -234,6 +269,11 @@ class RoverController(QObject):
         self.current_speed = -1
         self._ws_recv_thread = None
 
+        # 🚨 ESP-12E Sensor State
+        self.sensor_ws        = None
+        self.wall_detected    = False
+        self._sensor_thread   = None
+
     def start(self):
         if self.running: return
         self.log_message.emit("[CTRL] Starting...")
@@ -242,18 +282,27 @@ class RoverController(QObject):
         if not self._ws_connect():
             self.running = False; return
         self._ws_recv_thread = threading.Thread(target=self._ws_recv_loop, daemon=True, name="WSRecv")
+        self._sensor_thread  = threading.Thread(target=self._sensor_ws_recv_loop, daemon=True, name="SensorWSRecv")
+
         self._ws_recv_thread.start()
+        self._sensor_thread.start()
 
     def stop(self):
         if not self.running: return
         self.log_message.emit("[CTRL] Stopping...")
         self.running = False
-        if self._ws_recv_thread and self._ws_recv_thread.is_alive(): self._ws_recv_thread.join(timeout=1.5)
+        for t in (self._ws_recv_thread, self._sensor_thread):
+            if t and t.is_alive(): t.join(timeout=1.5)
         with self._ws_lock:
             if self.ws:
                 try: self._send_raw(CMD_STOP); self.ws.close()
                 except: pass
                 self.ws = None
+            if self.sensor_ws:
+                try: self.sensor_ws.close()
+                except: pass
+                self.sensor_ws = None
+        self.log_message.emit("[CTRL] Stopped.")
 
     def _ws_connect(self) -> bool:
         for attempt in range(5):
@@ -286,6 +335,39 @@ class RoverController(QObject):
                 if self.running: self.log_message.emit(f"[WS RECV] {e}"); self._ws_healthy = False
                 time.sleep(0.2)
 
+    # 🚨 SENSOR NON-BREAKING LOOP
+    def _sensor_ws_recv_loop(self):
+        while self.running:
+            if self.sensor_ws is None:
+                try:
+                    ws = websocket.WebSocket()
+                    ws.connect(SENSOR_WS_URL, timeout=2)
+                    self.sensor_ws = ws
+                    self.log_message.emit("[SENSOR] Ultrasonic ESP-12E Connected ✅")
+                except:
+                    time.sleep(2.0)
+                    continue
+
+            try:
+                self.sensor_ws.settimeout(1.0)
+                msg = self.sensor_ws.recv()
+                if msg:
+                    msg_str = str(msg).strip()
+                    if msg_str == "WALL_ALERT":
+                        self.wall_detected = True
+                        self.log_message.emit("🚨 WALL DETECTED! Forward movement blocked.")
+                        if self.last_cmd == CMD_FORWARD:
+                            self._send_motor(CMD_STOP)
+                    elif msg_str == "WALL_CLEARED":
+                        self.wall_detected = False
+                        self.log_message.emit("✅ WALL CLEARED! Path is open.")
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception as e:
+                self.sensor_ws = None
+                self.wall_detected = False
+                time.sleep(1.0)
+
     def _handle_ws_msg(self, msg: str):
         if msg == "PONG": self._last_pong = time.time(); self._ws_healthy = True; return
         if msg.startswith("DIST:"):
@@ -305,7 +387,14 @@ class RoverController(QObject):
         self._send_raw(f"SPD{val}"); self.current_speed = val
 
     def _send_motor(self, cmd: str):
-        if not self.running or cmd == self.last_cmd: return
+        if not self.running: return
+
+        # 🚨 THE SAFETY OVERRIDE GUARD
+        if getattr(self, 'wall_detected', False) and cmd == CMD_FORWARD:
+            cmd = CMD_STOP
+
+        if cmd == self.last_cmd: return
+
         reversal = (
             (cmd == CMD_FORWARD  and self.last_cmd == CMD_BACKWARD) or
             (cmd == CMD_BACKWARD and self.last_cmd == CMD_FORWARD)  or
@@ -419,7 +508,6 @@ class AppWindow(QMainWindow):
         fl = QVBoxLayout(frame); fl.setContentsMargins(25,25,25,25)
         grid = QWidget(); gl = QGridLayout(grid); gl.setVerticalSpacing(12)
 
-        # 🚨 UPDATED UI LABELS
         controls = [
             ("L Sign", "Left"), ("Three Fingers", "Right"),
             ("Point (Index)", "Forward"),  ("Peace Sign", "Backward"),
@@ -466,7 +554,7 @@ class AppWindow(QMainWindow):
         w = QWidget(); lo = QHBoxLayout(w); lo.setContentsMargins(0,0,0,0)
         lo.addWidget(QLabel("This Software is created for educational purposes")); lo.addStretch()
         b = QLabel("Beta"); b.setObjectName("betaTag"); lo.addWidget(b)
-        v = QLabel("v3.4.0"); v.setObjectName("versionTag"); lo.addWidget(v)
+        v = QLabel("v3.5.0"); v.setObjectName("versionTag"); lo.addWidget(v)
         return w
 
     def _shadow(self, w):
@@ -498,7 +586,7 @@ class AppWindow(QMainWindow):
 
     def _menu(self, name):
         if name == "about":
-            QMessageBox.information(self,"About","Rover Gesture Mode v3.4 (High Accuracy)\n\nDeveloped by Basilio, Baldovino and Francisco.")
+            QMessageBox.information(self,"About","Rover Gesture Mode v3.5 (High Accuracy)\n\nDeveloped by Basilio, Baldovino and Francisco.")
         elif name == "instructions":
             QMessageBox.information(self,"Instructions",
                 "High Five → Open Claw\nFist → Close Claw\n"
